@@ -5,23 +5,6 @@ import time
 from collections import OrderedDict
 import torch
 import torch._utils
-import torch.nn.functional as F
-import torch.nn as nn
-import torch.nn.parallel
-import torch.backends.cudnn as cudnn
-import torch.optim
-import torch.utils.data
-import torch.utils.data.distributed
-import torchvision.transforms as transforms
-import torchvision.datasets as datasets
-import numpy as np
-from random import randint
-import datetime
-
-from data_utils import get_tinyImgNet_train_loader, get_tinyImgNet_test_loader
-import pdb
-
-
 try:
     torch._utils._rebuild_tensor_v2
 except AttributeError:
@@ -32,155 +15,36 @@ except AttributeError:
         return tensor
     torch._utils._rebuild_tensor_v2 = _rebuild_tensor_v2
 
+import torch.nn as nn
+import torch.nn.parallel
+import torch.backends.cudnn as cudnn
+import torch.distributed as dist
+import torch.optim
+import torch.utils.data
+import torch.utils.data.distributed
+import torchvision.transforms as transforms
+import torchvision.datasets as datasets
+import torchvision.models as models
+from model_greedy import *
 
-class identity(nn.Module):
-    def __init__(self):
-        super(identity, self).__init__()
+import numpy as np
 
-    def forward(self, input):
-        return input
+from random import randint
+import datetime
 
-class psi(nn.Module):
-    def __init__(self, block_size):
-        super(psi, self).__init__()
-        self.block_size = block_size
-        self.block_size_sq = block_size*block_size
-
-    def forward(self, input):
-        output = input.permute(0, 2, 3, 1)
-        (batch_size, s_height, s_width, s_depth) = output.size()
-        d_depth = s_depth * self.block_size_sq
-        d_height = int(s_height / self.block_size)
-        t_1 = output.split(self.block_size, 2)
-        stack = [t_t.contiguous().view(batch_size, d_height, d_depth) for t_t in t_1]
-        output = torch.stack(stack, 1)
-        output = output.permute(0, 2, 1, 3)
-        output = output.permute(0, 3, 1, 2)
-        return output.contiguous()
-
-class block_conv(nn.Module):
-    expansion = 1
-    def __init__(self, in_planes, planes, stride=1,downsample=False,batchn=True):
-        super(block_conv, self).__init__()
-        self.downsample = downsample
-        if downsample:
-            self.down = psi(2)
-        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3,stride=stride, padding=1,bias=not batchn)
-        if batchn:
-            self.bn1 = nn.BatchNorm2d(planes)
-        else:
-            self.bn1 = identity() #Identity
-
-    def forward(self, x):
-        if self.downsample:
-            x = self.down(x)
-        out = F.relu(self.bn1(self.conv1(x)))
-        return out
-
-class greedyNet(nn.Module):
-    def __init__(self, block, num_blocks, feature_size=256,downsampling=1, downsample=[],batchnorm=True,strd=False):
-        super(greedyNet, self).__init__()
-        self.in_planes = feature_size
-        self.down_sampling = psi(downsampling)
-        self.downsample_init = downsampling
-        self.conv1 = nn.Conv2d(3*downsampling*downsampling, self.in_planes, kernel_size=3, stride=1, padding=1, bias=not batchnorm)
-        
-        if batchnorm:
-            self.bn1 = nn.BatchNorm2d(self.in_planes)
-        else:
-            self.bn1 = identity() #Identity
-        self.RELU = nn.ReLU()
-        self.blocks = []
-        self.blocks.append(nn.Sequential(self.conv1,self.bn1,self.RELU)) #n=0
-        self.batchn = batchnorm
-        for n in range(num_blocks-1):
-            inc = 2
-            if n in downsample:
-                if self.strd:
-                    dsample = False
-                    strd=2
-                    init_sz=1
-                else:
-                    dsample = True
-                    strd=1
-                    init_sz=4
-                self.blocks.append(block(self.in_planes * init_sz, self.in_planes * inc, strd, downsample=dsample,batchn=batchnorm))
-                self.in_planes = self.in_planes * inc
-            else:
-                self.blocks.append(block(self.in_planes,self.in_planes,1))
-
-        self.blocks = nn.ModuleList(self.blocks)
-        for n in range(num_blocks):
-            for p in self.blocks[n].parameters():
-                p.requires_grad = False
-
-    def unfreezeGradient(self,n):
-        for k in range(len(self.blocks)):
-            for p in self.blocks[k].parameters():
-                p.requires_grad = False
-
-        for p in self.blocks[n].parameters():
-            p.requires_grad = True
-
-    def add_block(self,block,downsample=False):
-        if downsample:
-            inc = 2
-            if self.strd:
-                dsample = False
-                strd=2
-                init_sz = 1
-            else:
-                dsample = True
-                strd=1
-                init_sz = 4
-
-            self.blocks.append(
-                block(self.in_planes * init_sz, self.in_planes * inc, strd, downsample=dsample,batchn=self.batchn))
-            self.in_planes = self.in_planes * inc
-        else:
-            self.blocks.append(block(self.in_planes,self.in_planes,1,batchn=self.batchn))
-
-    def forward(self, a):
-        x=a[0]
-        N=a[1]
-        out = x
-        if self.downsample_init>1:
-            out = self.down_sampling(x)
-        for n in range(N+1):
-            out=self.blocks[n](out)
-        return out
-
-
-class auxillary_classifier(nn.Module):
-    def __init__(self,avg_size=4,feature_size=256, in_size=32,num_classes=10,batchn=True):
-        super(auxillary_classifier, self).__init__()
-        if batchn:
-            self.bn = nn.BatchNorm2d(feature_size)
-        else:
-            self.bn = identity() #Identity
-        self.avg_size=avg_size
-
-        self.classifier = nn.Linear(feature_size*(in_size//avg_size)*(in_size//avg_size), num_classes)
-
-    def forward(self, x):
-        out = F.avg_pool2d(x, self.avg_size)
-        out = self.bn(out)
-        out = out.view(out.size(0), -1)
-        out = self.classifier(out)
-        return out
-
-
+from data_utils import get_tinyImgNet_train_loader, get_tinyImgNet_test_loader
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
-# parser.add_argument('data', metavar='DIR',
-#                     help='path to dataset')
-parser.add_argument('-j', '--workers', default=16, type=int, metavar='N',
+parser.add_argument('data', metavar='DIR',
+                    help='path to dataset')
+
+parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
 parser.add_argument('--epochs', default=90, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
-parser.add_argument('-b', '--batch-size', default=64, type=int,
+parser.add_argument('-b', '--batch-size', default=256, type=int,
                     metavar='N', help='mini-batch size (default: 256)')
 parser.add_argument('--lr', '--learning-rate', default=0.1, type=float,
                     metavar='LR', help='initial learning rate')
@@ -194,8 +58,6 @@ parser.add_argument('--resume', default='', type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
 parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
                     help='evaluate model on validation set')
-parser.add_argument('--pretrained', dest='pretrained', action='store_true',
-                    help='use pre-trained model')
 parser.add_argument('--world-size', default=1, type=int,
                     help='number of distributed processes')
 parser.add_argument('--dist-url', default='tcp://224.66.41.62:23456', type=str,
@@ -203,28 +65,31 @@ parser.add_argument('--dist-url', default='tcp://224.66.41.62:23456', type=str,
 parser.add_argument('--dist-backend', default='gloo', type=str,
                     help='distributed backend')
 
-parser.add_argument('--bn',  default=0,type=int, help='depth of the CNN')
-parser.add_argument('--ncnn',  default=8,type=int, help='depth of the CNN')
+
+parser.add_argument('--ncnn',  default=8,type=int, help='depth of the auxiliary CNN')
+parser.add_argument('--bn',  default=1,type=int, help='turn off/on batchnorm')
 parser.add_argument('--nepochs',  default=45,type=int, help='number of epochs')
-parser.add_argument('--epochdecay',  default=20,type=int, help='number of epochs')
-parser.add_argument('--avg_size',  default=8,type=int, help='size of the averaging')
-parser.add_argument('--feature_size',  default=256,type=int, help='size of the averaging')
+parser.add_argument('--epochdecay',  default=20,type=int, help='interval between lr decay')
+parser.add_argument('--avg_size',  default=7,type=int, help='size of the averaging')
+parser.add_argument('--feature_size',  default=128,type=int, help='width')
+parser.add_argument('--nlin',  default=2,type=int, help='number of non linearities in the auxillary')
 parser.add_argument('--ds',  default=2,type=int, help='initial downsampling')
 parser.add_argument('--ensemble', default=1,type=int,help='ensemble') # not implemented yet
 parser.add_argument('--name', default='',type=str,help='name')
-parser.add_argument('--debug', default=0,type=int,help='debug')
-parser.add_argument('--large_size_images', default=2,type=int,help='small images for debugging')
-parser.add_argument('--n_resume', default=0,type=int,help='which n we resume')
-parser.add_argument('--resume_epoch', default=0,type=int,help='which n we resume')
-parser.add_argument('--dilate', default=0,type=int,help='dilate')
-parser.add_argument('--resume_feat', default=0,type=int,help='deprecated')
-parser.add_argument('--down', default=1,type=int,help='perform downsampling ops')
-parser.add_argument('--save_folder', default='.',type=str,help='folder saving')
+parser.add_argument('--prog',  default=0,type=int, help='increase width of auxillary at downsampling')
+parser.add_argument('--debug', default=0,type=int,help='debugging')
+parser.add_argument('--large_size_images', default=2,type=int,help='use small images for faster testing')
+parser.add_argument('--n_resume', default=0,type=int,help='which layer we resume')
+parser.add_argument('--resume_epoch', default=0,type=int,help='which epoch we resume')
+parser.add_argument('--fixed_feat', default=512,type=int,help='auxillary width ')
+parser.add_argument('--down', default=1,type=int,help='use downsampling')
+parser.add_argument('--save_folder', default='.',type=str,help='down')
 
 # added by Bingbin
 parser.add_argument('--transform', default='none', type=str, choices=['all', 'none'],
                     help="Type of transform on training data.")
 parser.add_argument('--wandb-name', default='', type=str)
+
 
 args = parser.parse_args()
 best_prec1 = 0
@@ -239,12 +104,14 @@ name_log_txt = time_stamp + str(randint(0, N_CLS)) + args.name
 name_log_txt = name_log_txt +'.log'
 name_log_txt = os.path.join(args.save_folder, name_log_txt)
 
+
 args.ensemble = args.ensemble>0
+args.prog = args.prog >0
 args.debug = args.debug > 0
 args.bn = args.bn > 0
-args.dilate = args.dilate > 0 #toremove
-args.nlin=0 # We only do k=1 here as its a special case
-downsample = [1,2, 3]
+
+# downsample = [1,3,5,7]
+downsample = [1,3,5]
 args.down = args.down > 0
 
 try:
@@ -271,16 +138,23 @@ def main():
         print(args, file=text_file)
 
     n_cnn = args.ncnn
-    
 
-    model = greedyNet(block_conv,1,feature_size=args.feature_size,downsampling=args.ds,
-                         downsample=downsample,batchnorm=args.bn)
-    num_feat = args.feature_size
-    model_c = auxillary_classifier(avg_size=args.avg_size, in_size=in_size, feature_size=num_feat, num_classes=N_CLS, batchn=args.bn)
+    model = greedyNet(block_conv, 1, feature_size=args.feature_size, downsampling=args.ds,
+                      downsample=downsample, batchnorm=args.bn)
+
+
+    if args.fixed_feat:
+        num_feat = args.fixed_feat
+    else:
+        num_feat = args.feature_size
+    model_c = auxillary_classifier(avg_size=args.avg_size, in_size=N_img // args.ds,
+                                   n_lin=args.nlin, feature_size=num_feat,
+                                   input_features=args.feature_size, batchn=args.bn, num_classes=N_CLS)
 
     with open(name_log_txt, "a") as text_file:
         print(model, file=text_file)
         print(model_c, file=text_file)
+
 
     model = torch.nn.DataParallel(nn.Sequential(model,model_c)).cuda()
     model.module[0].unfreezeGradient(0)
@@ -299,8 +173,8 @@ def main():
     cudnn.benchmark = True
 
     # Data loading code
-    # traindir = os.path.join(args.data, 'train')
-    # valdir = os.path.join(args.data, 'val')
+    traindir = os.path.join(args.data, 'train')
+    valdir = os.path.join(args.data, 'val')
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
 
@@ -320,21 +194,33 @@ def main():
         validate(val_loader, model, criterion)
         return
 
+
     if (args.resume):
-        model_dict = torch.load(args.save_folder+'/'+args.resume + '_model.t7')
+        def load_model():
+            model_dict = torch.load(args.save_folder+'/'+args.resume + '_model.t7')
 
+            for key in list(model_dict.keys()):
+                if key[0:8]=='module.1':
+                    model_dict.pop(key,None)
+                else:
+                    model_dict = OrderedDict((key[9:] if k == key else k, v) for k, v in model_dict.items())
 
-        for key in list(model_dict.keys()):
-            if key[0:8]=='module.1':
-                model_dict.pop(key,None)
-            else:
-                model_dict = OrderedDict((key[9:] if k == key else k, v) for k, v in model_dict.items())
+            # 1. filter out unnecessary keys
+            sub_dict = {k: v for k, v in model.module[0].items() if k in model_dict}
+            # 2. overwrite entries in the existing state dict
+            model_dict.update(sub_dict)
+            model.module[0].load_state_dict(sub_dict)
+        load_model()
 
-        model.module[0].load_state_dict(model_dict)
+    correct_all = np.zeros(len(train_dataset))
+
 
     num_ep = args.nepochs
 
+
+
     for n in range(n_cnn):
+      #  torch.save(model_c.state_dict(), name_log_txt + '_model_c.t7')
         model.module[0].unfreezeGradient(n)
         lr = args.lr * 10.0
 
@@ -357,16 +243,9 @@ def main():
                     model.load_state_dict(model_dict)
             if (args.resume and n<args.n_resume):
                 if args.ensemble:
+                    load_model()
                     name = args.resume  + '_' + str(n) + '_model.t7'
                     model_c_dict = torch.load(args.save_folder+'/'+name)
-
-                    model_c = auxillary_classifier(avg_size=args.avg_size, in_size=in_size,
-                                                   n_lin=args.nlin, feature_size=args.feature_size,
-                                                   input_features=args.feature_size, num_classes=N_CLS)
-                    print(model_c)
-                    # model.module[1] = None
-                    model = torch.nn.DataParallel(nn.Sequential(model.module[0], model_c)).cuda()
-                    model_c=None
                     model.module[1].load_state_dict(model_c_dict)
                     top1train = -1
                     top5train = -1
@@ -382,12 +261,13 @@ def main():
 
 
             # evaluate on validation set
-            top1test, top5test, top1ens, top5ens = validate(val_loader, model,  criterion, n)
+            top1test, top5test, top1ens,top5ens = validate(val_loader, model,  criterion, n)
             if USE_WANDB:
               wandb.log({
                 'top1test': top1test,
                 'top5test': top5test,
               })
+
 
             prec1 = top1test
 
@@ -405,21 +285,26 @@ def main():
         if args.debug:
             num_ep = 1
         else:
-            # torch.save([weights_sample, correct_all, weight_ensemble], args.save_folder+'/'+ name_log_txt +'_'+str(n)+ '_sub_variable.t7')
             torch.save(model.state_dict(), args.save_folder+'/'+name_log_txt  +'_model.t7')
             torch.save(model.module[1].state_dict(),args.save_folder+'/'+ name_log_txt  +'_'+str(n)+'_model.t7')
-            torch.save(model_c.state_dict(), args.save_folder+'/'+name_log_txt  +'_model_c.t7')
 
 
         if args.down and n in downsample:
             args.avg_size = int(args.avg_size / 2)
             in_size = int(in_size / 2)
             args.feature_size = int(args.feature_size * 2)
+            args.fixed_feat=args.fixed_feat*2
 
-        print('create next auxillary classifier')
-        model_c = auxillary_classifier(avg_size=args.avg_size, in_size=in_size, feature_size=args.feature_size, num_classes=N_CLS, batchn=args.bn)
-        print('add a new layer')
-        model.module[0].add_block(block_conv, n in downsample)
+        if args.fixed_feat:
+            num_feat = args.fixed_feat
+        else:
+            num_feat = args.feature_size
+        print('reinit classifier')
+        model_c = None
+        model_c = auxillary_classifier(avg_size=args.avg_size, in_size=in_size,
+                                       n_lin=args.nlin, feature_size=num_feat,
+                                       input_features=args.feature_size, batchn=args.bn, num_classes=N_CLS).cuda()
+        model.module[0].add_block(n in downsample)
         model = torch.nn.DataParallel(nn.Sequential(model.module[0], model_c)).cuda()
         with open(name_log_txt, "a") as text_file:
             print(model, file=text_file)
@@ -435,14 +320,14 @@ def train(train_loader, model, criterion, optimizer, epoch, n):
     model.train()
     for k in range(n):
         model.module[0].blocks[k].eval()
-
+        print('woof')
 
     end = time.time()
     for i, (input, target) in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
 
-        target = target.cuda()
+        target = target.cuda(async=True)
         input_var = torch.autograd.Variable(input)
         target_var = torch.autograd.Variable(target)
 
@@ -469,7 +354,7 @@ def train(train_loader, model, criterion, optimizer, epoch, n):
         batch_time.update(time.time() - end)
         end = time.time()
 
-        if args.debug and i>50:
+        if args.debug and i>500:
             break
 
         if i % args.print_freq == 0:
@@ -486,7 +371,7 @@ def train(train_loader, model, criterion, optimizer, epoch, n):
 
 
 all_outs = [[] for i in range(args.ncnn)]
-def validate(loader, model, criterion, n):
+def validate(val_loader, model, criterion, n):
     batch_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
@@ -494,47 +379,48 @@ def validate(loader, model, criterion, n):
     all_targs = []
     # switch to evaluate mode
     model.eval()
-
+  #  model_c.eval()
 
     end = time.time()
     all_outs[n] = []
 
-    total = 0
-    for i, (input, target) in enumerate(loader):
-        target = target.cuda()
-        input_var = torch.autograd.Variable(input, volatile=True)
-        target_var = torch.autograd.Variable(target, volatile=True)
+    with torch.no_grad():
+        total = 0
+        for i, (input, target) in enumerate(val_loader):
+            target = target.cuda(non_blocking=True)
+            input = input.cuda(non_blocking=True)
+            input_var = torch.autograd.Variable(input)
+            target_var = torch.autograd.Variable(target)
 
-        # compute output
-        output = model([input_var, n])
-      #  output = model_c.forward(output)
+            # compute output
+            output = model([input_var, n])
 
 
-        loss = criterion(output, target_var)
-        # measure accuracy and record loss
-        prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
-        losses.update(loss.item(), input.size(0))
-        top1.update(prec1[0].item(), input.size(0))
-        top5.update(prec5[0].item(), input.size(0))
+            loss = criterion(output, target_var)
+            # measure accuracy and record loss
+            prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
+            losses.update(loss.item(), input.size(0))
+            top1.update(prec1[0].item(), input.size(0))
+            top5.update(prec5[0].item(), input.size(0))
 
-        # measure elapsed time
-        batch_time.update(time.time() - end)
-        end = time.time()
+            # measure elapsed time
+            batch_time.update(time.time() - end)
+            end = time.time()
 
-        if i % args.print_freq == 0:
-            print('Test: [{0}/{1}]\t'
-                  'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                  'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
-                  'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
-                i, len(loader), batch_time=batch_time, loss=losses,
-                top1=top1, top5=top5))
-        if args.ensemble:
-            all_outs[n].append(F.softmax(output).data.cpu())
-            all_targs.append(target_var.data.cpu())
-        total += input_var.size(0)
-    print(' * Prec@1 {top1.avg:.3f} Prec@5 {top5.avg:.3f}'
-          .format(top1=top1, top5=top5))
+            if i % args.print_freq == 0:
+                print('Test: [{0}/{1}]\t'
+                      'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                      'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                      'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
+                      'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
+                    i, len(val_loader), batch_time=batch_time, loss=losses,
+                    top1=top1, top5=top5))
+            if args.ensemble:
+                all_outs[n].append(F.softmax(output).data.cpu())
+                all_targs.append(target_var.data.cpu())
+            total += input_var.size(0)
+        print(' * Prec@1 {top1.avg:.3f} Prec@5 {top5.avg:.3f}'
+              .format(top1=top1, top5=top5))
 
     if args.ensemble:
         all_outs[n] = torch.cat(all_outs[n])
